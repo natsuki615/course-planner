@@ -116,7 +116,7 @@ const STORAGE_KEY = "bxaPlanner_v1";
 function freshState(){
   const scenario = { id: uid("scn"), name: "No Minor", minorProgramIds: [], assignments: [] };
   return { courses:[], programs: defaultPrograms(), depts: Object.assign({}, DEFAULT_DEPTS),
-    scenarios: [scenario], activeScenarioId: scenario.id };
+    scenarios: [scenario], activeScenarioId: scenario.id, extraTerms: [], inProgressMigrated: true };
 }
 // Older saves had one global `assignments` list instead of per-scenario ones.
 // Wrap it into a single scenario covering whatever minors already existed, so nothing is lost.
@@ -135,6 +135,15 @@ function migrateState(parsed){
   if(scsPattern && !scsPattern.depts.includes("07")){
     scsPattern.depts.push("07"); scsPattern.depts.sort();
     electives.note = (electives.note||"").replace("(02,05,10,", "(02,05,07,10,");
+  }
+  // Empty semesters the user added to the plan grid so they can drag courses into them.
+  if(!Array.isArray(parsed.extraTerms)) parsed.extraTerms = [];
+  // "In progress" didn't exist as a status before; courses in the current term were saved as planned.
+  if(!parsed.inProgressMigrated){
+    for(const c of parsed.courses){
+      if(c.status==="planned" && termCompare(c.semester) === 0) c.status = "inprogress";
+    }
+    parsed.inProgressMigrated = true;
   }
   return parsed;
 }
@@ -161,6 +170,9 @@ function uid(prefix){ return prefix + "_" + Math.random().toString(36).slice(2,9
 function normalizeCode(raw){
   if(!raw) return "";
   let s = raw.trim().replace(/\s+/g,"");
+  // Accept SIO-style codes without the hyphen: 15322 -> 15-322
+  const bare = s.match(/^(\d{2})(\d{3})$/);
+  if(bare) s = bare[1] + "-" + bare[2];
   const parts = s.split("-");
   if(parts.length < 2) return s;
   let dept = parts[0]; if(dept.length === 1) dept = "0"+dept;
@@ -199,6 +211,24 @@ function semesterGroupLabel(semester){
 // A school year runs Fall (year Y) -> Spring/Summer (year Y+1). Returns Y.
 function schoolYearOf(season, year){
   return season === "Fall" ? year : year - 1;
+}
+function termIndex(parts){ return parts.year*3 + ({Spring:0, Summer:1, Fall:2})[parts.season]; }
+function currentTerm(){
+  const now = new Date(), m = now.getMonth();
+  return {season: m<=4 ? "Spring" : m<=6 ? "Summer" : "Fall", year: now.getFullYear()};
+}
+// -1 past, 0 current, 1 future; null if the semester isn't a "Season Year" term.
+function termCompare(semester){
+  const parts = parseSemesterParts(semester);
+  if(!parts) return null;
+  return Math.sign(termIndex(parts) - termIndex(currentTerm()));
+}
+const STATUS_LABELS = {taken:"taken", inprogress:"in progress", planned:"planned"};
+const NEXT_STATUS = {planned:"inprogress", inprogress:"taken", taken:"planned"};
+function statusLabel(status){ return STATUS_LABELS[status] || status; }
+function parseStatus(raw){
+  const s = (raw||"").trim().toLowerCase().replace(/[\s_-]/g,"");
+  return s==="taken" ? "taken" : (s==="inprogress" || s==="current") ? "inprogress" : "planned";
 }
 function escapeHtml(s){
   return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -276,14 +306,27 @@ function getAssignedCourses(programId, categoryId){
     .map(a => findCourse(a.courseId))
     .filter(Boolean);
 }
+// Returns the course filling each slot (or null). Courses whose code matches a slot claim it first;
+// courses forced into the category (no matching code) then fill whatever slots are left, in order.
+function fillSlots(category, assigned){
+  const filled = category.slots.map(()=>null);
+  const used = new Set();
+  category.slots.forEach((slot, i) => {
+    const c = assigned.find(c => !used.has(c.id) && slot.codes.includes(c.code));
+    if(c){ filled[i] = c; used.add(c.id); }
+  });
+  const forced = assigned.filter(c => !used.has(c.id) && !categoryMatchesCourse(category, c.code));
+  filled.forEach((c, i) => { if(!c && forced.length) filled[i] = forced.shift(); });
+  return filled;
+}
 function categoryProgress(program, category){
   const assigned = getAssignedCourses(program.id, category.id);
   const unitsEarned = assigned.reduce((s,c)=>s+(Number(c.units)||0),0);
   const coursesEarned = assigned.length;
   if(category.kind === "fixed"){
-    const filledSlots = category.slots.filter(slot => slot.codes.some(code => assigned.some(c=>c.code===code)));
-    const complete = filledSlots.length >= category.slots.length;
-    return {assigned, unitsEarned, coursesEarned, filledSlots: filledSlots.length, totalSlots: category.slots.length, complete};
+    const filledSlots = fillSlots(category, assigned).filter(Boolean).length;
+    const complete = filledSlots >= category.slots.length;
+    return {assigned, unitsEarned, coursesEarned, filledSlots, totalSlots: category.slots.length, complete};
   } else {
     const courseOk = category.minCourses ? coursesEarned >= category.minCourses : true;
     const unitOk = category.minUnits ? unitsEarned >= category.minUnits : true;
@@ -296,22 +339,23 @@ function programProgress(program){
   // explicit target of 0 (e.g. a prerequisite that doesn't count toward the major's own
   // units) is excluded from both sides; a category with no target at all (null) still adds
   // whatever's been earned to the numerator, since there's nothing to cap it against.
-  // unitsTaken is the same calculation counting only taken courses (unitsEarned includes planned ones).
-  let unitsEarned = 0, unitsTaken = 0, unitsTarget = 0;
+  // unitsTaken is the same calculation counting only taken courses, unitsThroughNow counts taken + in progress
+  // (unitsEarned includes planned ones too).
+  let unitsEarned = 0, unitsTaken = 0, unitsThroughNow = 0, unitsTarget = 0;
+  const sumUnits = cs => cs.reduce((s,c)=>s+(Number(c.units)||0),0);
   for(const {category} of allCategories(program)){
     const prog = categoryProgress(program, category);
-    const taken = prog.assigned.filter(c=>c.status==="taken").reduce((s,c)=>s+(Number(c.units)||0),0);
-    if(category.targetUnits != null){
-      unitsTarget += category.targetUnits;
-      unitsEarned += Math.min(prog.unitsEarned, category.targetUnits);
-      unitsTaken += Math.min(taken, category.targetUnits);
-    } else {
-      unitsEarned += prog.unitsEarned;
-      unitsTaken += taken;
-    }
+    const taken = sumUnits(prog.assigned.filter(c=>c.status==="taken"));
+    const throughNow = sumUnits(prog.assigned.filter(c=>c.status!=="planned"));
+    const cap = u => category.targetUnits != null ? Math.min(u, category.targetUnits) : u;
+    if(category.targetUnits != null) unitsTarget += category.targetUnits;
+    unitsEarned += cap(prog.unitsEarned);
+    unitsTaken += cap(taken);
+    unitsThroughNow += cap(throughNow);
   }
   const pctOf = u => unitsTarget ? Math.min(100, Math.round(u/unitsTarget*100)) : 0;
-  return {unitsEarned, unitsTaken, unitsTarget, pct: pctOf(unitsEarned), takenPct: pctOf(unitsTaken)};
+  return {unitsEarned, unitsTaken, unitsThroughNow, unitsTarget,
+    pct: pctOf(unitsEarned), takenPct: pctOf(unitsTaken), nowPct: pctOf(unitsThroughNow)};
 }
 function setAssignment(courseId, programId, categoryId){
   const scenario = activeScenario();
@@ -337,17 +381,18 @@ function matchSpecificity(category, code){
 function categoryHasRoom(program, category, course){
   const prog = categoryProgress(program, category);
   if(category.kind === "fixed"){
-    return category.slots.some(slot => slot.codes.includes(course.code) && !slot.codes.some(code => prog.assigned.some(c=>c.code===code)));
+    const filled = fillSlots(category, prog.assigned);
+    return category.slots.some((slot, i) => slot.codes.includes(course.code) && !filled[i]);
   }
   if(category.requireDifferentDepartments && prog.assigned.some(c => deptOf(c.code)===deptOf(course.code))) return false;
   return !prog.complete;
 }
-// Taken before planned, then chronological; semesters that aren't "Season Year" (e.g. AP/Transfer) go last
-// so real coursework claims specific requirements first.
+// Taken, then in progress, then planned; then chronological. Semesters that aren't "Season Year" (e.g. AP/Transfer)
+// go last so real coursework claims specific requirements first.
 function autoAssignOrder(course){
   const parts = parseSemesterParts(course.semester);
-  const chrono = parts ? parts.year*3 + ({Spring:0, Summer:1, Fall:2})[parts.season] : Infinity;
-  return [course.status==="taken" ? 0 : 1, chrono];
+  const chrono = parts ? termIndex(parts) : Infinity;
+  return [({taken:0, inprogress:1})[course.status] ?? 2, chrono];
 }
 // Fills "Counts toward" for every program in the active scenario where the course has no assignment yet.
 // Existing assignments are never changed. Returns how many assignments were made.
@@ -401,13 +446,18 @@ function render(){
 }
 function renderHeader(){
   const bcsa = findProgram("bcsa");
-  let pct = 0, takenPct = 0, earned = 0, taken = 0, target = 380;
-  if(bcsa){ const pp = programProgress(bcsa); ({pct, takenPct, unitsEarned: earned, unitsTaken: taken, unitsTarget: target} = pp); }
+  let pct = 0, takenPct = 0, nowPct = 0, earned = 0, taken = 0, throughNow = 0, target = 380;
+  if(bcsa){
+    const pp = programProgress(bcsa);
+    ({pct, takenPct, nowPct, unitsEarned: earned, unitsTaken: taken, unitsThroughNow: throughNow, unitsTarget: target} = pp);
+  }
   document.getElementById("overallBarFill").style.width = takenPct + "%";
-  document.getElementById("overallBarPlanned").style.width = (pct - takenPct) + "%";
-  const planned = earned - taken;
+  document.getElementById("overallBarInProgress").style.width = (nowPct - takenPct) + "%";
+  document.getElementById("overallBarPlanned").style.width = (pct - nowPct) + "%";
+  const inProgress = throughNow - taken, planned = earned - throughNow;
   document.getElementById("overallText").textContent =
     `${fmtUnits(taken)} / ${fmtUnits(target)} units completed toward BCSA degree (${takenPct}%)` +
+    (inProgress > 0 ? ` · +${fmtUnits(inProgress)} in progress` : "") +
     (planned > 0 ? ` · +${fmtUnits(planned)} planned (${pct}% with planned)` : "");
   const sel = document.getElementById("scenarioSwitcher");
   if(sel){
@@ -426,16 +476,52 @@ function statusDot(complete, started, hasPlanned){
 }
 
 // ---------- Courses tab ----------
+// Every semester cell (and the "No semester set" group) is a drop target: data-drop-term is the semester
+// string a dragged course gets, "" meaning unscheduled.
 function renderSemesterCell(season, year, group){
+  const term = `${season} ${year}`;
   if(!group || group.length===0){
-    return `<div class="semester-cell empty"><h3>${season} ${year}</h3><div class="muted">No courses</div></div>`;
+    const removable = season==="Summer" && state.extraTerms.includes(term);
+    return `<div class="semester-cell empty" data-drop-term="${term}">
+      <h3>${term}${removable?` <button class="icon-btn" title="Remove this summer" data-action="removeTerm" data-term="${term}">✕</button>`:""}</h3>
+      <div class="muted">Drag planned courses here</div>
+    </div>`;
   }
   const sorted = group.slice().sort((a,b)=>a.code.localeCompare(b.code));
   const units = sorted.reduce((s,c)=>s+(Number(c.units)||0),0);
-  return `<div class="semester-cell">
-    <h3>${season} ${year} <span class="muted">(${sorted.length} course${sorted.length===1?"":"s"}, ${fmtUnits(units)} units)</span></h3>
+  return `<div class="semester-cell" data-drop-term="${term}">
+    <h3>${term} <span class="muted">(${sorted.length} course${sorted.length===1?"":"s"}, ${fmtUnits(units)} units)</span></h3>
     ${sorted.map(renderCourseRow).join("")}
   </div>`;
+}
+// Every Fall/Spring/Summer from the earliest school year on the grid through the latest, for the semester dropdown.
+function planTerms(){
+  const keys = [...state.courses.map(c=>c.semester), ...state.extraTerms]
+    .map(parseSemesterParts).filter(Boolean).map(p=>schoolYearOf(p.season, p.year));
+  const now = currentTerm();
+  keys.push(schoolYearOf(now.season, now.year));
+  const terms = [];
+  for(let key = Math.min(...keys); key <= Math.max(...keys); key++){
+    terms.push(`Fall ${key}`, `Spring ${key+1}`, `Summer ${key+1}`);
+  }
+  return terms;
+}
+function renderSemesterSelect(course){
+  const current = semesterGroupLabel(course.semester);
+  const terms = planTerms();
+  // Keep a non-"Season Year" semester (e.g. AP/Transfer) selectable so the dropdown doesn't silently change it.
+  if(course.semester && !terms.includes(current)) terms.unshift(current);
+  const opts = terms.map(term => `<option value="${escapeHtml(term)}" ${term===current?"selected":""}>${escapeHtml(term)}</option>`).join("");
+  return `<select class="semester-select" data-action="setSemester" data-id="${course.id}" title="Move to semester">
+    <option value="" ${course.semester?"":"selected"}>No semester</option>${opts}
+  </select>`;
+}
+function nextPlanYear(){
+  const keys = [...state.courses.map(c=>c.semester), ...state.extraTerms]
+    .map(parseSemesterParts).filter(Boolean).map(p=>schoolYearOf(p.season, p.year));
+  if(keys.length) return Math.max(...keys) + 1;
+  const now = currentTerm();
+  return schoolYearOf(now.season, now.year);
 }
 function renderCoursesTab(){
   const allCourses = state.courses.slice();
@@ -448,49 +534,72 @@ function renderCoursesTab(){
     groups.get(label).push(c);
   }
 
-  const yearRows = new Map(); // schoolYearOf -> {Fall, Spring, Summer}
+  const yearRows = new Map(); // schoolYearOf -> {Fall, Spring, Summer, showSummer}
+  const yearBucket = key => { if(!yearRows.has(key)) yearRows.set(key, {}); return yearRows.get(key); };
   const otherLabels = [];
   for(const [label, group] of groups){
     const parts = parseSemesterParts(label);
     if(parts){
-      const key = schoolYearOf(parts.season, parts.year);
-      if(!yearRows.has(key)) yearRows.set(key, {});
-      yearRows.get(key)[parts.season] = group;
+      const bucket = yearBucket(schoolYearOf(parts.season, parts.year));
+      bucket[parts.season] = group;
+      if(parts.season==="Summer") bucket.showSummer = true;
     } else {
       otherLabels.push(label);
     }
+  }
+  // Empty semesters added via "+ Add next year" / "+ Summer" so courses can be planned into them.
+  for(const term of state.extraTerms){
+    const parts = parseSemesterParts(term); if(!parts) continue;
+    const bucket = yearBucket(schoolYearOf(parts.season, parts.year));
+    if(parts.season==="Summer") bucket.showSummer = true;
   }
 
   const yearGridHtml = [...yearRows.keys()].sort((a,b)=>a-b).map(key => {
     const bucket = yearRows.get(key);
     const cells = [renderSemesterCell("Fall", key, bucket.Fall), renderSemesterCell("Spring", key+1, bucket.Spring)];
-    if(bucket.Summer) cells.push(renderSemesterCell("Summer", key+1, bucket.Summer));
-    return `<div class="year-row">${cells.join("")}</div>`;
+    if(bucket.showSummer) cells.push(renderSemesterCell("Summer", key+1, bucket.Summer));
+    const isEmpty = !bucket.Fall && !bucket.Spring && !bucket.Summer;
+    return `<div class="year-block">
+      <div class="year-head">
+        <span>${key}–${String(key+1).slice(2)}</span>
+        ${bucket.showSummer?"":`<button class="btn secondary small" data-action="addSummer" data-term="Summer ${key+1}">+ Summer</button>`}
+        ${isEmpty?`<button class="btn secondary small" data-action="removeYear" data-year="${key}">Remove year</button>`:""}
+      </div>
+      <div class="year-row">${cells.join("")}</div>
+    </div>`;
   }).join("");
 
+  const renderOtherGroup = (label, dropTerm) => {
+    const sorted = (groups.get(label) || []).slice().sort((a,b)=>a.code.localeCompare(b.code));
+    const units = sorted.reduce((s,c)=>s+(Number(c.units)||0),0);
+    return `<div class="semester-group"${dropTerm!=null?` data-drop-term="${dropTerm}"`:""}>
+      <h3>${escapeHtml(label)} <span class="muted">(${sorted.length} course${sorted.length===1?"":"s"}, ${fmtUnits(units)} units)</span></h3>
+      ${sorted.length ? sorted.map(renderCourseRow).join("") : '<div class="muted">Drag a planned course here to unschedule it.</div>'}
+    </div>`;
+  };
+  // "No semester set" is always shown (last) so courses can be dragged back out of a semester.
   const otherHtml = otherLabels
-    .sort((a,b)=> (a==="No semester set") - (b==="No semester set") || a.localeCompare(b))
-    .map(label => {
-      const sorted = groups.get(label).slice().sort((a,b)=>a.code.localeCompare(b.code));
-      const units = sorted.reduce((s,c)=>s+(Number(c.units)||0),0);
-      return `<div class="semester-group">
-        <h3>${escapeHtml(label)} <span class="muted">(${sorted.length} course${sorted.length===1?"":"s"}, ${fmtUnits(units)} units)</span></h3>
-        ${sorted.map(renderCourseRow).join("")}
-      </div>`;
-    }).join("");
+    .filter(label => label!=="No semester set")
+    .sort((a,b)=> a.localeCompare(b))
+    .map(label => renderOtherGroup(label, null))
+    .join("") + renderOtherGroup("No semester set", "");
 
-  const groupsHtml = `<div class="year-grid">${yearGridHtml}</div>${otherHtml}`;
+  const groupsHtml = `<div class="year-grid">${yearGridHtml}</div>
+    <div class="top-actions" style="justify-content:flex-start;margin-top:-10px;margin-bottom:24px;">
+      <button class="btn secondary" data-action="addPlanYear">+ Add ${nextPlanYear()}–${String(nextPlanYear()+1).slice(2)} school year</button>
+    </div>
+    ${otherHtml}`;
   return `
     <div class="card">
       <h2>Add a course</h2>
-      <p class="muted">Enter a course number like <code>15-322</code>. The department and (if known) the name/units auto-fill.</p>
+      <p class="muted">Enter a course number like <code>15-322</code> or <code>15322</code>. The department and (if known) the name/units auto-fill.</p>
       <form id="addCourseForm" class="row" onsubmit="return false;">
         <div class="field"><label>Course code</label><input id="newCode" placeholder="15-322" autocomplete="off"></div>
         <div class="field"><label>Department</label><input id="newDept" disabled style="width:230px;"></div>
         <div class="field" style="flex:1;min-width:220px;"><label>Course name</label><input id="newName" placeholder="Course name"></div>
         <div class="field" style="width:90px;"><label>Units</label><input id="newUnits" type="number" step="0.5" placeholder="9"></div>
         <div class="field"><label>Status</label>
-          <select id="newStatus"><option value="planned">Planned</option><option value="taken">Taken</option></select>
+          <select id="newStatus"><option value="planned">Planned</option><option value="inprogress">In progress</option><option value="taken">Taken</option></select>
         </div>
         <div class="field" style="width:130px;"><label>Semester</label><input id="newSemester" placeholder="Fall 2026"></div>
         <div class="field"><button class="btn" id="addCourseBtn" data-action="addCourse">Add Course</button></div>
@@ -502,49 +611,67 @@ function renderCoursesTab(){
       </div>
     </div>
     <h2 class="section-heading">My Courses (${courses.length})</h2>
+    ${courses.length>0 ? `<p class="muted" style="margin:-8px 0 16px;">Drag planned and in-progress courses between semesters to plan ahead.</p>` : ""}
     ${hiddenCount>0 ? `<p class="muted" style="margin:-8px 0 16px;">${hiddenCount} course${hiddenCount===1?"":"s"} hidden — ${hiddenCount===1?"it":"they"} only count${hiddenCount===1?"s":""} toward a minor that isn't part of the "${escapeHtml(activeScenario().name)}" scenario (switch scenarios in the header, or check the Programs tab).</p>` : ""}
     ${courses.length===0 ? `<div class="empty-state">${allCourses.length===0?"No courses yet — add your first one above.":"Nothing to show in this scenario — every course only counts toward minors from a different scenario."}</div>` : groupsHtml}
   `;
 }
-function renderCourseRow(course){
-  const matches = matchablePrograms(course.code);
-  const showAll = !!(courseUiState[course.id] && courseUiState[course.id].showAll);
-  const programsToShow = showAll ? relevantPrograms().map(p=>({program:p, categories:allCategories(p)})) : matches;
-  const matchedProgramIds = new Set(matches.map(m=>m.program.id));
-
-  const assignRows = programsToShow.map(({program, categories}) => {
-    const current = getAssignmentForProgram(course.id, program.id);
-    const isForced = showAll && !matchedProgramIds.has(program.id);
-    const opts = categories.map(({category}) => {
-      const matched = categoryMatchesCourse(category, course.code);
-      const sel = current && current.categoryId===category.id ? "selected" : "";
-      return `<option value="${category.id}" ${sel}>${escapeHtml(category.name)}${matched?"":" (manual)"}</option>`;
-    }).join("");
-    return `<div class="assign-row">
-      <span class="pname">${escapeHtml(program.name)}${isForced?' <span class="tag">manual</span>':''}</span>
-      <select data-action="assign" data-course="${course.id}" data-program="${program.id}">
-        <option value="">— none —</option>${opts}
-      </select>
-    </div>`;
+// One dropdown per program: matching categories first (most specific on top), then every other
+// category grouped by section so a course can be forced anywhere.
+function renderAssignSelect(course, program){
+  const current = getAssignmentForProgram(course.id, program.id);
+  const opt = category => `<option value="${category.id}" ${current && current.categoryId===category.id ? "selected" : ""}>${escapeHtml(category.name)}</option>`;
+  const all = allCategories(program);
+  const suggested = all
+    .map(({category}, i) => ({category, i}))
+    .filter(({category}) => categoryMatchesCourse(category, course.code))
+    .map(x => ({...x, rank: matchSpecificity(x.category, course.code)}))
+    .sort((a,b)=> a.rank-b.rank || a.i-b.i)
+    .map(x => x.category);
+  const suggestedHtml = suggested.length ? `<optgroup label="Suggested">${suggested.map(opt).join("")}</optgroup>` : "";
+  const forceHtml = program.sections.map(section => {
+    const others = section.categories.filter(c => !categoryMatchesCourse(c, course.code));
+    return others.length ? `<optgroup label="Force → ${escapeHtml(section.name)}">${others.map(opt).join("")}</optgroup>` : "";
   }).join("");
+  const currentCat = current && findCategory(program.id, current.categoryId);
+  const isForced = currentCat && !categoryMatchesCourse(currentCat, course.code);
+  return `<div class="assign-row">
+    <span class="pname">${escapeHtml(program.name)}${isForced?' <span class="tag tag-forced">forced</span>':''}</span>
+    <select data-action="assign" data-course="${course.id}" data-program="${program.id}">
+      <option value="">— none —</option>${suggestedHtml}${forceHtml}
+    </select>
+  </div>`;
+}
+function renderCourseRow(course){
+  const showAll = !!(courseUiState[course.id] && courseUiState[course.id].showAll);
+  const matchedProgramIds = new Set(matchablePrograms(course.code).map(m=>m.program.id));
+  // Programs the course doesn't match (and isn't already forced into) stay hidden until asked for.
+  const isShown = p => matchedProgramIds.has(p.id) || getAssignmentForProgram(course.id, p.id);
+  const hiddenCount = relevantPrograms().filter(p => !isShown(p)).length;
+  const assignRows = relevantPrograms()
+    .filter(p => showAll || isShown(p))
+    .map(p => renderAssignSelect(course, p))
+    .join("");
+  const draggable = course.status !== "taken";
 
-  return `<div class="course-row" data-course-row="${course.id}">
+  return `<div class="course-row" data-course-row="${course.id}"${draggable?` draggable="true" data-drag-course="${course.id}"`:""}>
     <div class="course-row-top">
+      ${draggable?'<span class="drag-grip" title="Drag to another semester">⋮⋮</span>':""}
       <span class="course-code">${escapeHtml(course.code)}</span>
       <span class="dept-tag">${escapeHtml(deptName(course.code))}</span>
       <span class="course-name">${escapeHtml(course.name)||'<span class="muted">(no name)</span>'}</span>
     </div>
     <div class="course-row-meta">
       <span class="course-units">${fmtUnits(course.units)} units</span>
-      <button class="status-badge status-${course.status} status-toggle" data-action="toggleStatus" data-id="${course.id}" title="Click to mark as ${course.status==="taken"?"planned":"taken"}">${course.status} ⇄</button>
-      <span class="muted">${escapeHtml(course.semester||"")}</span>
+      <button class="status-badge status-${course.status} status-toggle" data-action="toggleStatus" data-id="${course.id}" title="Click to mark as ${statusLabel(NEXT_STATUS[course.status] || "planned")}">${statusLabel(course.status)} ⇄</button>
+      ${draggable ? renderSemesterSelect(course) : `<span class="muted">${escapeHtml(course.semester||"")}</span>`}
       <button class="icon-btn" title="Edit" data-action="editCourse" data-id="${course.id}">✏️</button>
       <button class="icon-btn" title="Delete" data-action="deleteCourse" data-id="${course.id}">🗑️</button>
     </div>
     <div class="assign-area">
       <div class="muted" style="margin-bottom:6px;">Counts toward:</div>
       ${assignRows || '<div class="muted">No matching requirements found.</div>'}
-      <button class="btn secondary small" data-action="toggleShowAll" data-id="${course.id}">${showAll?"Hide non-matching requirements":"Show all requirements (manual override)"}</button>
+      ${hiddenCount>0 || showAll ? `<button class="btn secondary small" data-action="toggleShowAll" data-id="${course.id}">${showAll?"Hide non-matching programs":`Force into another program (${hiddenCount})`}</button>` : ""}
     </div>
   </div>`;
 }
@@ -579,8 +706,11 @@ function renderRequirementsTab(){
           if(category.minUnits) parts.push(`${fmtUnits(prog.unitsEarned)}/${fmtUnits(category.minUnits)} units`);
           statText = parts.join(", ") || `${fmtUnits(prog.unitsEarned)} units`;
         }
-        const chips = prog.assigned.map(c=>`<span class="chip chip-${c.status}">${escapeHtml(c.code)}</span>`).join("");
-        const hasPlanned = prog.assigned.some(c=>c.status==="planned");
+        const chips = prog.assigned.map(c=>{
+          const forced = !categoryMatchesCourse(category, c.code);
+          return `<span class="chip chip-${c.status}" title="${statusLabel(c.status)}${forced?" · forced into this category":""}">${escapeHtml(c.code)}${forced?"*":""}</span>`;
+        }).join("");
+        const hasPlanned = prog.assigned.some(c=>c.status!=="taken");
         return `<div class="cat-row">
           ${statusDot(prog.complete, prog.assigned.length>0, hasPlanned)}
           <span class="cat-name">${escapeHtml(category.name)}</span>
@@ -804,7 +934,32 @@ document.addEventListener("click", e=>{
     case "addCourse": { handleAddCourse(); break; }
     case "toggleStatus": {
       const c = findCourse(t.dataset.id); if(!c) return;
-      c.status = c.status==="taken" ? "planned" : "taken";
+      c.status = NEXT_STATUS[c.status] || "planned";
+      saveState(); render();
+      break;
+    }
+    case "addPlanYear": {
+      const key = nextPlanYear();
+      state.extraTerms.push(`Fall ${key}`, `Spring ${key+1}`);
+      saveState(); render();
+      break;
+    }
+    case "addSummer": {
+      if(!state.extraTerms.includes(t.dataset.term)) state.extraTerms.push(t.dataset.term);
+      saveState(); render();
+      break;
+    }
+    case "removeTerm": {
+      state.extraTerms = state.extraTerms.filter(term => term!==t.dataset.term);
+      saveState(); render();
+      break;
+    }
+    case "removeYear": {
+      const key = parseInt(t.dataset.year, 10);
+      state.extraTerms = state.extraTerms.filter(term => {
+        const parts = parseSemesterParts(term);
+        return !parts || schoolYearOf(parts.season, parts.year)!==key;
+      });
       saveState(); render();
       break;
     }
@@ -826,10 +981,10 @@ document.addEventListener("click", e=>{
       const c = findCourse(t.dataset.id); if(!c) return;
       const name = prompt("Course name:", c.name); if(name===null) return;
       const units = prompt("Units:", c.units); if(units===null) return;
-      const status = prompt("Status (taken/planned):", c.status); if(status===null) return;
+      const status = prompt("Status (taken / in progress / planned):", statusLabel(c.status)); if(status===null) return;
       const semester = prompt("Semester:", c.semester||""); if(semester===null) return;
       c.name = name; c.units = parseFloat(units)||0;
-      c.status = (status.trim().toLowerCase()==="taken") ? "taken" : "planned";
+      c.status = parseStatus(status);
       c.semester = semester;
       saveState(); render();
       break;
@@ -998,6 +1153,13 @@ document.addEventListener("change", e=>{
       render();
       break;
     }
+    case "setSemester": {
+      const course = findCourse(t.dataset.id); if(!course) return;
+      course.semester = t.value;
+      saveState(); render();
+      toast(t.value ? `Moved ${course.code} to ${t.value}.` : `${course.code} is now unscheduled.`);
+      break;
+    }
     case "switchScenarioQuick": {
       state.activeScenarioId = t.value;
       saveState(); render();
@@ -1075,7 +1237,7 @@ document.addEventListener("change", e=>{
 document.addEventListener("input", e=>{
   if(e.target.id==="newCode"){
     const code = normalizeCode(e.target.value);
-    document.getElementById("newDept").value = code.includes("-") ? deptName(code) : "";
+    document.getElementById("newDept").value = /^\d{2}/.test(code) ? deptName(code.slice(0,2)) : "";
     if(COURSE_CATALOG[code]){
       const [name, units] = COURSE_CATALOG[code];
       const nameEl = document.getElementById("newName"), unitsEl = document.getElementById("newUnits");
@@ -1083,6 +1245,56 @@ document.addEventListener("input", e=>{
       if(!unitsEl.value) unitsEl.value = units;
     }
   }
+});
+
+// ---------- Drag planned courses between semesters ----------
+let dragCourseId = null;
+let dragFromControl = false;
+// A course card is draggable, but grabbing its dropdown or buttons shouldn't start a drag.
+document.addEventListener("mousedown", e=>{ dragFromControl = !!e.target.closest("select,button,input,textarea"); });
+document.addEventListener("dragstart", e=>{
+  const card = e.target.closest && e.target.closest("[data-drag-course]");
+  if(!card) return;
+  if(dragFromControl){ e.preventDefault(); return; }
+  dragCourseId = card.dataset.dragCourse;
+  e.dataTransfer.effectAllowed = "move";
+  e.dataTransfer.setData("text/plain", dragCourseId);
+  card.classList.add("dragging");
+});
+document.addEventListener("dragend", ()=>{
+  dragCourseId = null;
+  document.querySelectorAll(".dragging, .drop-over").forEach(el => el.classList.remove("dragging", "drop-over"));
+});
+// Browsers barely auto-scroll during a drag, so scroll the page when the pointer nears the top/bottom edge.
+const DRAG_SCROLL_EDGE = 120;
+document.addEventListener("dragover", e=>{
+  if(!dragCourseId) return;
+  if(e.clientY < DRAG_SCROLL_EDGE) window.scrollBy(0, -Math.ceil((DRAG_SCROLL_EDGE - e.clientY) / 4));
+  else if(e.clientY > window.innerHeight - DRAG_SCROLL_EDGE) window.scrollBy(0, Math.ceil((e.clientY - (window.innerHeight - DRAG_SCROLL_EDGE)) / 4));
+});
+document.addEventListener("dragover", e=>{
+  const zone = dragCourseId && e.target.closest("[data-drop-term]");
+  if(!zone) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  document.querySelectorAll(".drop-over").forEach(el => { if(el!==zone) el.classList.remove("drop-over"); });
+  zone.classList.add("drop-over");
+});
+document.addEventListener("dragleave", e=>{
+  const zone = e.target.closest && e.target.closest("[data-drop-term]");
+  if(zone && !zone.contains(e.relatedTarget)) zone.classList.remove("drop-over");
+});
+document.addEventListener("drop", e=>{
+  const zone = dragCourseId && e.target.closest("[data-drop-term]");
+  if(!zone) return;
+  e.preventDefault();
+  const course = findCourse(dragCourseId);
+  const term = zone.dataset.dropTerm;
+  dragCourseId = null;
+  if(!course || (course.semester||"") === term) { render(); return; }
+  course.semester = term;
+  saveState(); render();
+  toast(term ? `Moved ${course.code} to ${term}.` : `${course.code} is now unscheduled.`);
 });
 
 document.body.addEventListener("change", e=>{
@@ -1113,7 +1325,7 @@ function handleAddCourse(){
   const status = document.getElementById("newStatus").value;
   const semester = document.getElementById("newSemester").value.trim();
   if(!code || !/^\d{2}-\d{2,3}$/.test(code)){
-    alert("Please enter a valid course code like 15-322.");
+    alert("Please enter a valid course code like 15-322 or 15322.");
     return;
   }
   state.courses.push({ id: uid("crs"), code, name: name || (COURSE_CATALOG[code]?COURSE_CATALOG[code][0]:""), units, status, semester });
@@ -1186,7 +1398,8 @@ function parseTranscriptLines(lines){
       code,
       name: COURSE_CATALOG[code] ? COURSE_CATALOG[code][0] : titleCase(title),
       units: parseFloat(units),
-      status: grade ? "taken" : "planned", // no grade yet = in progress
+      // No grade yet: in progress if it's this term (or an earlier one), planned if registered for a future term.
+      status: grade ? "taken" : (termCompare(semester) === 1 ? "planned" : "inprogress"),
       semester,
     });
   }
