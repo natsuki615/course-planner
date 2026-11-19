@@ -394,25 +394,32 @@ function autoAssignOrder(course){
   const chrono = parts ? termIndex(parts) : Infinity;
   return [({taken:0, inprogress:1})[course.status] ?? 2, chrono];
 }
-// Fills "Counts toward" for every program in the active scenario where the course has no assignment yet.
+// Most specific matching category in this program, or null. With requireRoom=false, a full category still qualifies.
+function bestCategory(program, course, requireRoom){
+  const best = allCategories(program)
+    .filter(({category}) => categoryMatchesCourse(category, course.code) && (!requireRoom || categoryHasRoom(program, category, course)))
+    .map(({category}, i) => ({category, rank: matchSpecificity(category, course.code), i}))
+    .sort((a,b)=> a.rank-b.rank || a.i-b.i)[0];
+  return best ? best.category : null;
+}
+// Puts each course that doesn't count toward anything yet into ONE program: the first in scenario order
+// (main degree, then minors) with a matching requirement that has room. Double-counting is left to the user.
 // Existing assignments are never changed. Returns how many assignments were made.
 function autoAssignCourses(courses){
   const ordered = courses.slice().sort((a,b)=>{
     const ka = autoAssignOrder(a), kb = autoAssignOrder(b);
     return ka[0]-kb[0] || (ka[1]===kb[1] ? 0 : ka[1] < kb[1] ? -1 : 1);
   });
-  const scenario = activeScenario();
+  const programs = relevantPrograms();
   let made = 0;
   for(const course of ordered){
-    for(const program of relevantPrograms()){
-      if(getAssignmentForProgram(course.id, program.id)) continue;
-      const best = allCategories(program)
-        .filter(({category}) => categoryMatchesCourse(category, course.code) && categoryHasRoom(program, category, course))
-        .map(({category}, i) => ({category, rank: matchSpecificity(category, course.code), i}))
-        .sort((a,b)=> a.rank-b.rank || a.i-b.i)[0];
-      if(!best) continue;
-      scenario.assignments.push({id:uid("asn"), courseId:course.id, programId:program.id, categoryId:best.category.id});
+    if(programs.some(p => getAssignmentForProgram(course.id, p.id))) continue;
+    for(const program of programs){
+      const category = bestCategory(program, course, true);
+      if(!category) continue;
+      setAssignment(course.id, program.id, category.id);
       made++;
+      break;
     }
   }
   saveState();
@@ -648,8 +655,18 @@ function renderCourseRow(course){
   // Programs the course doesn't match (and isn't already forced into) stay hidden until asked for.
   const isShown = p => matchedProgramIds.has(p.id) || getAssignmentForProgram(course.id, p.id);
   const hiddenCount = relevantPrograms().filter(p => !isShown(p)).length;
+  // With several programs in the scenario, the user picks which ones this course counts toward
+  // (each dropdown can already force any requirement, so the force button isn't needed there).
+  const multiProgram = relevantPrograms().length > 1;
+  const openPrograms = (courseUiState[course.id] && courseUiState[course.id].openPrograms) || {};
+  const isOn = p => !!getAssignmentForProgram(course.id, p.id) || !!openPrograms[p.id];
+  const programPicker = multiProgram ? `<div class="program-picker">${relevantPrograms().map(p => {
+    const on = isOn(p), matched = matchedProgramIds.has(p.id);
+    return `<button class="program-toggle ${on?"on":""}" data-action="toggleProgram" data-course="${course.id}" data-program="${p.id}"
+      title="${on?"Stop counting toward":"Count toward"} ${escapeHtml(p.name)}${matched?"":" (no requirement matches — you'll pick one manually)"}">${on?"✓ ":""}${escapeHtml(p.name)}</button>`;
+  }).join("")}</div>` : "";
   const assignRows = relevantPrograms()
-    .filter(p => showAll || isShown(p))
+    .filter(p => multiProgram ? isOn(p) : (showAll || isShown(p)))
     .map(p => renderAssignSelect(course, p))
     .join("");
   const draggable = course.status !== "taken";
@@ -670,8 +687,9 @@ function renderCourseRow(course){
     </div>
     <div class="assign-area">
       <div class="muted" style="margin-bottom:6px;">Counts toward:</div>
-      ${assignRows || '<div class="muted">No matching requirements found.</div>'}
-      ${hiddenCount>0 || showAll ? `<button class="btn secondary small" data-action="toggleShowAll" data-id="${course.id}">${showAll?"Hide non-matching programs":`Force into another program (${hiddenCount})`}</button>` : ""}
+      ${programPicker}
+      ${assignRows || (multiProgram ? "" : '<div class="muted">No matching requirements found.</div>')}
+      ${!multiProgram && (hiddenCount>0 || showAll) ? `<button class="btn secondary small" data-action="toggleShowAll" data-id="${course.id}">${showAll?"Hide non-matching programs":`Force into another program (${hiddenCount})`}</button>` : ""}
     </div>
   </div>`;
 }
@@ -987,6 +1005,22 @@ document.addEventListener("click", e=>{
       c.status = parseStatus(status);
       c.semester = semester;
       saveState(); render();
+      break;
+    }
+    case "toggleProgram": {
+      const course = findCourse(t.dataset.course), program = findProgram(t.dataset.program);
+      if(!course || !program) return;
+      const ui = courseUiState[course.id] = courseUiState[course.id] || {};
+      ui.openPrograms = ui.openPrograms || {};
+      if(getAssignmentForProgram(course.id, program.id) || ui.openPrograms[program.id]){
+        setAssignment(course.id, program.id, null);
+        delete ui.openPrograms[program.id];
+      } else {
+        const category = bestCategory(program, course, true) || bestCategory(program, course, false);
+        if(category) setAssignment(course.id, program.id, category.id);
+        else ui.openPrograms[program.id] = true; // nothing matches: show the dropdown so they can pick manually
+      }
+      render();
       break;
     }
     case "toggleShowAll": {

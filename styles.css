@@ -73,6 +73,10 @@
   .status-planned{background:#ddeeff;color:#0969da;}
   .status-inprogress{background:#fff1d6;color:#9a6700;}
   .assign-area{margin-top:12px;padding-top:12px;border-top:1px dashed var(--border);}
+  .program-picker{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;}
+  .program-toggle{font:inherit;font-size:12px;padding:4px 10px;border-radius:14px;border:1px solid var(--border);background:var(--card);color:var(--muted);cursor:pointer;}
+  .program-toggle:hover{border-color:var(--accent);}
+  .program-toggle.on{background:var(--accent);border-color:var(--accent);color:white;}
   .assign-row{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;}
   .assign-row .pname{font-size:12.5px;min-width:150px;color:var(--muted);flex:1 1 150px;}
   .assign-row select{flex:1 1 200px;min-width:0;max-width:100%;}
