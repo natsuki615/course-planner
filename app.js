@@ -223,12 +223,12 @@ function termCompare(semester){
   if(!parts) return null;
   return Math.sign(termIndex(parts) - termIndex(currentTerm()));
 }
-const STATUS_LABELS = {taken:"taken", inprogress:"in progress", planned:"planned"};
-const NEXT_STATUS = {planned:"inprogress", inprogress:"taken", taken:"planned"};
+const STATUS_LABELS = {taken:"taken", inprogress:"in progress", registered:"registered", planned:"planned"};
+const NEXT_STATUS = {planned:"registered", registered:"inprogress", inprogress:"taken", taken:"planned"};
 function statusLabel(status){ return STATUS_LABELS[status] || status; }
 function parseStatus(raw){
   const s = (raw||"").trim().toLowerCase().replace(/[\s_-]/g,"");
-  return s==="taken" ? "taken" : (s==="inprogress" || s==="current") ? "inprogress" : "planned";
+  return s==="taken" ? "taken" : (s==="inprogress" || s==="current") ? "inprogress" : s==="registered" ? "registered" : "planned";
 }
 function escapeHtml(s){
   return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -339,23 +339,25 @@ function programProgress(program){
   // explicit target of 0 (e.g. a prerequisite that doesn't count toward the major's own
   // units) is excluded from both sides; a category with no target at all (null) still adds
   // whatever's been earned to the numerator, since there's nothing to cap it against.
-  // unitsTaken is the same calculation counting only taken courses, unitsThroughNow counts taken + in progress
-  // (unitsEarned includes planned ones too).
-  let unitsEarned = 0, unitsTaken = 0, unitsThroughNow = 0, unitsTarget = 0;
+  // unitsTaken is the same calculation counting only taken courses, unitsThroughNow counts taken + in progress,
+  // unitsRegistered adds registered ones (unitsEarned includes planned ones too).
+  let unitsEarned = 0, unitsTaken = 0, unitsThroughNow = 0, unitsRegistered = 0, unitsTarget = 0;
   const sumUnits = cs => cs.reduce((s,c)=>s+(Number(c.units)||0),0);
   for(const {category} of allCategories(program)){
     const prog = categoryProgress(program, category);
     const taken = sumUnits(prog.assigned.filter(c=>c.status==="taken"));
-    const throughNow = sumUnits(prog.assigned.filter(c=>c.status!=="planned"));
+    const throughNow = sumUnits(prog.assigned.filter(c=>c.status==="taken" || c.status==="inprogress"));
+    const registered = sumUnits(prog.assigned.filter(c=>c.status!=="planned"));
     const cap = u => category.targetUnits != null ? Math.min(u, category.targetUnits) : u;
     if(category.targetUnits != null) unitsTarget += category.targetUnits;
     unitsEarned += cap(prog.unitsEarned);
     unitsTaken += cap(taken);
     unitsThroughNow += cap(throughNow);
+    unitsRegistered += cap(registered);
   }
   const pctOf = u => unitsTarget ? Math.min(100, Math.round(u/unitsTarget*100)) : 0;
-  return {unitsEarned, unitsTaken, unitsThroughNow, unitsTarget,
-    pct: pctOf(unitsEarned), takenPct: pctOf(unitsTaken), nowPct: pctOf(unitsThroughNow)};
+  return {unitsEarned, unitsTaken, unitsThroughNow, unitsRegistered, unitsTarget,
+    pct: pctOf(unitsEarned), takenPct: pctOf(unitsTaken), nowPct: pctOf(unitsThroughNow), registeredPct: pctOf(unitsRegistered)};
 }
 function setAssignment(courseId, programId, categoryId){
   const scenario = activeScenario();
@@ -387,12 +389,12 @@ function categoryHasRoom(program, category, course){
   if(category.requireDifferentDepartments && prog.assigned.some(c => deptOf(c.code)===deptOf(course.code))) return false;
   return !prog.complete;
 }
-// Taken, then in progress, then planned; then chronological. Semesters that aren't "Season Year" (e.g. AP/Transfer)
+// Taken, then in progress, then registered, then planned; then chronological. Semesters that aren't "Season Year" (e.g. AP/Transfer)
 // go last so real coursework claims specific requirements first.
 function autoAssignOrder(course){
   const parts = parseSemesterParts(course.semester);
   const chrono = parts ? termIndex(parts) : Infinity;
-  return [({taken:0, inprogress:1})[course.status] ?? 2, chrono];
+  return [({taken:0, inprogress:1, registered:2})[course.status] ?? 3, chrono];
 }
 // Most specific matching category in this program, or null. With requireRoom=false, a full category still qualifies.
 function bestCategory(program, course, requireRoom){
@@ -453,18 +455,21 @@ function render(){
 }
 function renderHeader(){
   const bcsa = findProgram("bcsa");
-  let pct = 0, takenPct = 0, nowPct = 0, earned = 0, taken = 0, throughNow = 0, target = 380;
+  let pct = 0, takenPct = 0, nowPct = 0, registeredPct = 0, earned = 0, taken = 0, throughNow = 0, registered = 0, target = 380;
   if(bcsa){
     const pp = programProgress(bcsa);
-    ({pct, takenPct, nowPct, unitsEarned: earned, unitsTaken: taken, unitsThroughNow: throughNow, unitsTarget: target} = pp);
+    ({pct, takenPct, nowPct, registeredPct, unitsEarned: earned, unitsTaken: taken, unitsThroughNow: throughNow,
+      unitsRegistered: registered, unitsTarget: target} = pp);
   }
   document.getElementById("overallBarFill").style.width = takenPct + "%";
   document.getElementById("overallBarInProgress").style.width = (nowPct - takenPct) + "%";
-  document.getElementById("overallBarPlanned").style.width = (pct - nowPct) + "%";
-  const inProgress = throughNow - taken, planned = earned - throughNow;
+  document.getElementById("overallBarRegistered").style.width = (registeredPct - nowPct) + "%";
+  document.getElementById("overallBarPlanned").style.width = (pct - registeredPct) + "%";
+  const inProgress = throughNow - taken, registeredOnly = registered - throughNow, planned = earned - registered;
   document.getElementById("overallText").textContent =
     `${fmtUnits(taken)} / ${fmtUnits(target)} units completed toward BCSA degree (${takenPct}%)` +
     (inProgress > 0 ? ` · +${fmtUnits(inProgress)} in progress` : "") +
+    (registeredOnly > 0 ? ` · +${fmtUnits(registeredOnly)} registered` : "") +
     (planned > 0 ? ` · +${fmtUnits(planned)} planned (${pct}% with planned)` : "");
   const sel = document.getElementById("scenarioSwitcher");
   if(sel){
@@ -606,7 +611,7 @@ function renderCoursesTab(){
         <div class="field" style="flex:1;min-width:220px;"><label>Course name</label><input id="newName" placeholder="Course name"></div>
         <div class="field" style="width:90px;"><label>Units</label><input id="newUnits" type="number" step="0.5" placeholder="9"></div>
         <div class="field"><label>Status</label>
-          <select id="newStatus"><option value="planned">Planned</option><option value="inprogress">In progress</option><option value="taken">Taken</option></select>
+          <select id="newStatus"><option value="planned">Planned</option><option value="registered">Registered</option><option value="inprogress">In progress</option><option value="taken">Taken</option></select>
         </div>
         <div class="field" style="width:130px;"><label>Semester</label><input id="newSemester" placeholder="Fall 2026"></div>
         <div class="field"><button class="btn" id="addCourseBtn" data-action="addCourse">Add Course</button></div>
@@ -618,7 +623,7 @@ function renderCoursesTab(){
       </div>
     </div>
     <h2 class="section-heading">My Courses (${courses.length})</h2>
-    ${courses.length>0 ? `<p class="muted" style="margin:-8px 0 16px;">Drag planned and in-progress courses between semesters to plan ahead.</p>` : ""}
+    ${courses.length>0 ? `<p class="muted" style="margin:-8px 0 16px;">Drag any course that isn't taken yet between semesters to plan ahead.</p>` : ""}
     ${hiddenCount>0 ? `<p class="muted" style="margin:-8px 0 16px;">${hiddenCount} course${hiddenCount===1?"":"s"} hidden — ${hiddenCount===1?"it":"they"} only count${hiddenCount===1?"s":""} toward a minor that isn't part of the "${escapeHtml(activeScenario().name)}" scenario (switch scenarios in the header, or check the Programs tab).</p>` : ""}
     ${courses.length===0 ? `<div class="empty-state">${allCourses.length===0?"No courses yet — add your first one above.":"Nothing to show in this scenario — every course only counts toward minors from a different scenario."}</div>` : groupsHtml}
   `;
@@ -999,7 +1004,7 @@ document.addEventListener("click", e=>{
       const c = findCourse(t.dataset.id); if(!c) return;
       const name = prompt("Course name:", c.name); if(name===null) return;
       const units = prompt("Units:", c.units); if(units===null) return;
-      const status = prompt("Status (taken / in progress / planned):", statusLabel(c.status)); if(status===null) return;
+      const status = prompt("Status (taken / in progress / registered / planned):", statusLabel(c.status)); if(status===null) return;
       const semester = prompt("Semester:", c.semester||""); if(semester===null) return;
       c.name = name; c.units = parseFloat(units)||0;
       c.status = parseStatus(status);
@@ -1301,10 +1306,12 @@ document.addEventListener("dragend", ()=>{
 });
 // Browsers barely auto-scroll during a drag, so scroll the page when the pointer nears the top/bottom edge.
 const DRAG_SCROLL_EDGE = 120;
+const DRAG_SCROLL_MAX = 10; // px per dragover at the very edge; ramps down to 1px at the inner edge of the zone
 document.addEventListener("dragover", e=>{
   if(!dragCourseId) return;
-  if(e.clientY < DRAG_SCROLL_EDGE) window.scrollBy(0, -Math.ceil((DRAG_SCROLL_EDGE - e.clientY) / 4));
-  else if(e.clientY > window.innerHeight - DRAG_SCROLL_EDGE) window.scrollBy(0, Math.ceil((e.clientY - (window.innerHeight - DRAG_SCROLL_EDGE)) / 4));
+  const step = depth => Math.ceil(DRAG_SCROLL_MAX * depth / DRAG_SCROLL_EDGE);
+  if(e.clientY < DRAG_SCROLL_EDGE) window.scrollBy(0, -step(DRAG_SCROLL_EDGE - e.clientY));
+  else if(e.clientY > window.innerHeight - DRAG_SCROLL_EDGE) window.scrollBy(0, step(e.clientY - (window.innerHeight - DRAG_SCROLL_EDGE)));
 });
 document.addEventListener("dragover", e=>{
   const zone = dragCourseId && e.target.closest("[data-drop-term]");
@@ -1432,8 +1439,8 @@ function parseTranscriptLines(lines){
       code,
       name: COURSE_CATALOG[code] ? COURSE_CATALOG[code][0] : titleCase(title),
       units: parseFloat(units),
-      // No grade yet: in progress if it's this term (or an earlier one), planned if registered for a future term.
-      status: grade ? "taken" : (termCompare(semester) === 1 ? "planned" : "inprogress"),
+      // No grade yet: in progress if it's this term (or an earlier one), registered if it's a future term.
+      status: grade ? "taken" : (termCompare(semester) === 1 ? "registered" : "inprogress"),
       semester,
     });
   }
